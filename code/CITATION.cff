@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this code or data, please cite it as below."
+type: software
+title: "Unfilled Seconds That Demand Cannot Recover: Duration Menus, maxseq and Live CTV Ad Pods: reproducibility artifact"
+authors:
+  - family-names: Chaudhary
+    given-names: Prashant
+    orcid: "https://orcid.org/0009-0001-1980-109X"
+version: "1.0.0"
+license: Apache-2.0
+repository-code: "https://github.com/methodtrace/2026-pod-unfilled-seconds"
+keywords:
+  - connected TV
+  - ad pods
+  - OpenRTB
+  - dynamic ad insertion
+  - numerical semigroups

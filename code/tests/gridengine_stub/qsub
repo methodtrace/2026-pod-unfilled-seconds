@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Local stand-in for Grid Engine's qsub, for testing cluster/submit.sh, lane.sh and final.sh on one machine.
+
+Supports what those scripts use: -terse, -q, -t N or N-M, -pe smp N, -l, -o PATH, -j y, -cwd, -N, -S, -v VARS,
+-hold_jid ID[,ID...]. The script's own "#$" lines are read first and command-line options override them, as in
+Grid Engine. Each array task runs in the background in its own process group with SGE_TASK_ID, NSLOTS, JOB_ID,
+JOB_NAME and the -v variables set, in a minimal environment (like a job submitted without -V). A held job
+starts once every task of the held jobs has ended, whatever its exit status. Output goes to the -o path (a
+directory gets NAME.oJOBID.TASK files). State lives in $QSUB_STUB_DIR (required):
+  jobs/JOBID/task-K.pgid   process group of a running task (kill it with: kill -TERM -PGID)
+  jobs/JOBID/task-K.exit   exit status once the task has ended
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+
+def die(msg):
+    sys.stderr.write("qsub (stub): %s\n" % msg)
+    sys.exit(2)
+
+
+def parse(tokens, opt):
+    i = 0
+    rest = []
+    while i < len(tokens):
+        t = tokens[i]
+        if t in ("-terse", "-cwd"):
+            opt[t[1:]] = True
+            i += 1
+        elif t == "-pe":
+            if tokens[i + 1] != "smp":
+                die("only the smp parallel environment is emulated")
+            opt["slots"] = int(tokens[i + 2])
+            i += 3
+        elif t in ("-q", "-t", "-l", "-o", "-j", "-N", "-S", "-v", "-hold_jid"):
+            if t == "-v":
+                opt.setdefault("v", []).append(tokens[i + 1])
+            else:
+                opt[t[1:]] = tokens[i + 1]
+            i += 2
+        elif t.startswith("-"):
+            die("option %s is not emulated" % t)
+        else:
+            rest = tokens[i:]
+            break
+    return rest
+
+
+def task_range(spec):
+    if not spec:
+        return [None]
+    spec = spec.split(":")[0]
+    if "-" in spec:
+        a, b = spec.split("-")
+        return list(range(int(a), int(b) + 1))
+    return [int(spec)]
+
+
+def job_dir(state, jid):
+    return os.path.join(state, "jobs", str(jid))
+
+
+def job_ended(state, jid):
+    d = job_dir(state, jid)
+    if not os.path.isdir(d):
+        return True  # unknown job: Grid Engine ignores holds on finished or unknown jobs
+    with open(os.path.join(d, "tasks")) as f:
+        tasks = f.read().split()
+    return all(task_ended(d, k) for k in tasks)
+
+
+def task_ended(d, k):
+    """A task has ended when it recorded its exit status, or when it was killed: its process group is gone."""
+    if os.path.exists(os.path.join(d, "task-%s.exit" % k)):
+        return True
+    p = os.path.join(d, "task-%s.pgid" % k)
+    if not os.path.exists(p):
+        return False  # not started yet
+    try:
+        os.killpg(int(open(p).read()), 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+
+def run_task(state, jid, task):
+    """Runs detached: wait for holds, then run the script for one task and record its exit status."""
+    d = job_dir(state, jid)
+    with open(os.path.join(d, "spec")) as f:
+        spec = json.load(f)
+    for h in spec["hold"]:
+        while not job_ended(state, h):
+            time.sleep(0.5)
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "TMPDIR") if k in os.environ}
+    env.update(spec["vars"])
+    env.update(JOB_ID=str(jid), JOB_NAME=spec["name"], NSLOTS=str(spec["slots"]), QUEUE=spec["queue"])
+    tag = "1" if task == "0" else task
+    if task != "0":
+        env["SGE_TASK_ID"] = task
+    else:
+        env["SGE_TASK_ID"] = "undefined"
+    out = spec["o"]
+    if out.endswith("/") or os.path.isdir(out):
+        out = os.path.join(out, "%s.o%s.%s" % (spec["name"], jid, tag))
+    with open(os.path.join(d, "task-%s.pgid" % task), "w") as f:
+        f.write(str(os.getpgid(0)))
+    with open(out, "ab") as log:
+        rc = subprocess.call([spec["shell"], spec["script"]] + spec["args"], cwd=spec["cwd"], env=env,
+                             stdout=log, stderr=subprocess.STDOUT)
+    tmp = os.path.join(d, "task-%s.exit.tmp" % task)
+    with open(tmp, "w") as f:
+        f.write(str(rc))
+    os.replace(tmp, os.path.join(d, "task-%s.exit" % task))
+
+
+def main(argv):
+    state = os.environ.get("QSUB_STUB_DIR")
+    if not state:
+        die("set QSUB_STUB_DIR to a state directory")
+    if argv[:1] == ["--run-task"]:
+        run_task(state, argv[1], argv[2])
+        return 0
+    opt = {}
+    rest = parse(argv, opt)
+    if not rest:
+        die("no script given")
+    script, args = rest[0], rest[1:]
+    if not os.path.isfile(script):
+        die("script %s not found" % script)
+    directives = []
+    with open(script) as f:
+        for ln in f:
+            if ln.startswith("#$ "):
+                directives += shlex.split(ln[3:])
+    defaults = {}
+    parse(directives, defaults)
+    for k, v in defaults.items():
+        if k == "v":
+            opt["v"] = v + opt.get("v", [])
+        else:
+            opt.setdefault(k, v)
+    if opt.get("j", "n") != "y":
+        die("only -j y is emulated")
+    cwd = os.getcwd() if opt.get("cwd") else os.environ.get("HOME", "/")
+    vars_ = {}
+    for group in opt.get("v", []):
+        for kv in group.split(","):
+            k, _, v = kv.partition("=")
+            vars_[k] = v if _ else os.environ.get(k, "")
+    os.makedirs(os.path.join(state, "jobs"), exist_ok=True)
+    cpath = os.path.join(state, "counter")
+    jid = int(open(cpath).read()) + 1 if os.path.exists(cpath) else 1001
+    with open(cpath, "w") as f:
+        f.write(str(jid))
+    d = job_dir(state, jid)
+    os.makedirs(d)
+    tasks = task_range(opt.get("t"))
+    tnames = ["0" if t is None else str(t) for t in tasks]
+    o = opt.get("o", ".")
+    if not os.path.isabs(o):
+        o = os.path.join(cwd, o)
+    spec = dict(script=os.path.abspath(script), args=args, cwd=cwd, vars=vars_, name=opt.get("N", "job"),
+                slots=opt.get("slots", 1), queue=opt.get("q", "default"), o=o, shell=opt.get("S", "/bin/sh"),
+                hold=[h.split(".")[0] for h in opt.get("hold_jid", "").split(",") if h])
+    with open(os.path.join(d, "spec"), "w") as f:
+        json.dump(spec, f)
+    with open(os.path.join(d, "tasks"), "w") as f:
+        f.write(" ".join(tnames))
+    for t in tnames:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--run-task", str(jid), t],
+                         start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, env=dict(os.environ))
+    if opt.get("terse"):
+        # like Grid Engine: "1001" for a plain job, "1001.1-3:1" for an array job
+        print("%d.%d-%d:1" % (jid, tasks[0], tasks[-1]) if opt.get("t") else jid)
+    else:
+        print('Your job %d ("%s") has been submitted' % (jid, spec["name"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

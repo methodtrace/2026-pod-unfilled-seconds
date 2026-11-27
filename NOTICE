@@ -1,0 +1,8 @@
+Unfilled seconds that demand cannot recover: code and data
+Copyright 2026 Prashant Chaudhary
+
+The code (code/) is licensed under the Apache License, Version 2.0 (LICENSE).
+The data (data/ and code/expected/) are licensed under CC BY 4.0 (LICENSE-data.md).
+
+code/vendor/sumset-undershoot/ is copyright 2026 Prashant Chaudhary and Kapil Khandelwal and is licensed under
+the Apache License, Version 2.0 (code/vendor/sumset-undershoot/LICENSE).
